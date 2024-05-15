@@ -1,0 +1,4 @@
+---
+metrics_port: 9941
+meshtastic_addr: 10.174.2.42:4403
+namespace: "meshtastic"
