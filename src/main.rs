@@ -23,18 +23,19 @@ use tokio::sync::{mpsc, OnceCell, RwLock};
 use tracing_subscriber::EnvFilter;
 use metrics_util::MetricKindMask;
 use std::time;
-use ::metrics::gauge;
+use ::metrics::{counter, gauge};
 use tokio::task::JoinHandle;
-use crate::consts::{GPS_PRECISION_FACTOR, LOOP_PAUSE_MILLISECONDS};
+use crate::consts::{GPS_PRECISION_FACTOR, LABEL_SENSOR_CHANNEL, LOOP_PAUSE_MILLISECONDS};
 use anyhow::Result;
 use meshtastic::protobufs::from_radio::PayloadVariant;
-use meshtastic::protobufs::{DeviceMetadata, MeshPacket, MyNodeInfo, NodeInfo, PortNum, Position, User};
+use meshtastic::protobufs::{DeviceMetadata, MeshPacket, MyNodeInfo, NodeInfo, PortNum, Position, Telemetry, User};
 use meshtastic::protobufs::mesh_packet::PayloadVariant as mp_variant;
 use strum::Display;
 use crate::metrics::*;
 use std::string::ToString;
 use std::time::{SystemTime, UNIX_EPOCH};
 use meshtastic::Message;
+use meshtastic::protobufs::telemetry::Variant;
 
 pub fn die(msg: &str) {
     println!("{}", msg);
@@ -89,12 +90,12 @@ pub async fn main() {
     //endregion
 
     //region spawn meshtastic connection thread
-    let (mut fromradio_thread_tx, mut fromradio_thread_rx) =
+    let (fromradio_thread_tx, mut fromradio_thread_rx) =
         mpsc::channel::<IPCMessage>(consts::MPSC_BUFFER_SIZE);
-    let (mut toradio_thread_tx, mut toradio_thread_rx) =
+    let (toradio_thread_tx, toradio_thread_rx) =
         mpsc::channel::<IPCMessage>(consts::MPSC_BUFFER_SIZE);
     let fromradio_tx = fromradio_thread_tx.clone();
-    let mut join_handle: JoinHandle<Result<()>> = tokio::task::spawn(async move {
+    let join_handle: JoinHandle<Result<()>> = tokio::task::spawn(async move {
         meshtastic_loop(conn, fromradio_tx, toradio_thread_rx).await
     });
     //endregion
@@ -152,7 +153,6 @@ pub async fn process_my_info(packet: &MyNodeInfo) {
 }
 
 pub async fn process_metadata(metadata: &DeviceMetadata) {
-    info!("{:#?}", metadata);
     let device_id: String;
     {
         let config = SETTINGS.read().await;
@@ -175,7 +175,7 @@ pub async fn process_node_info(node_info: &NodeInfo) {
     ];
     gauge!(METRIC_SNR, &labels).set(node_info.snr);
     gauge!(METRIC_HOPS_AWAY, &labels).set(node_info.hops_away);
-    gauge!(METRIC_RX_MSG_COUNT, &labels).increment(1);
+    counter!(METRIC_RX_MSG_COUNT, &labels).increment(1);
     gauge!(METRIC_LAST_HEARD_SECS, &labels).set(node_info.last_heard);
     if let Some(dm) = &node_info.device_metrics {
         gauge!(METRIC_CHAN_UTIL, &labels).set(dm.channel_utilization);
@@ -192,12 +192,20 @@ pub async fn process_mesh_packet(mesh_packet: &MeshPacket) {
             match content.portnum() {
                 PortNum::PositionApp => process_position_app(&mesh_packet).await,
                 PortNum::NodeinfoApp => process_nodeinfo_app(&mesh_packet).await,
-                PortNum::TelemetryApp => {}
+                PortNum::TelemetryApp => process_telemetry_app(&mesh_packet).await,
                 PortNum::NeighborinfoApp => {}
                 _ => {
                     info!("Received a payload of {} but we don't consume its data.",content.portnum().as_str_name());
                 }
             }
+            let device_id = match content.source {
+                0 => { format!("!{:x}", mesh_packet.from) }
+                _ => { format!("!{:x}", content.source) }
+            };
+            let labels = vec![
+                (consts::LABEL_DEVICE_ID, device_id),
+            ];
+            counter!(METRIC_RX_MSG_COUNT, &labels).increment(1);
         }
     }
 }
@@ -223,10 +231,6 @@ pub async fn process_position_app(packet: &MeshPacket) {
 pub async fn process_nodeinfo_app(packet: &MeshPacket) {
     let mp_variant::Decoded(content) = packet.clone().payload_variant.unwrap() else { unreachable!() };
     let data = User::decode(content.payload.as_slice()).unwrap();
-    let device_id = match content.source {
-        0 => { format!("!{:x}", packet.from) }
-        _ => { format!("!{:x}", content.source) }
-    };
     let labels = vec![
         (consts::LABEL_DEVICE_ID, data.clone().id),
         (consts::LABEL_HW_MODEL, data.clone().hw_model().as_str_name().to_string()),
@@ -238,6 +242,69 @@ pub async fn process_nodeinfo_app(packet: &MeshPacket) {
 
     gauge!(METRIC_DEVICE_INFO, &labels).set(get_secs() as f64);
 }
+
+pub async fn process_telemetry_app(packet: &MeshPacket) {
+    let mp_variant::Decoded(content) = packet.clone().payload_variant.unwrap() else { unreachable!() };
+    let data = Telemetry::decode(content.payload.as_slice()).unwrap();
+    let device_id = match content.source {
+        0 => { format!("!{:x}", packet.from) }
+        _ => { format!("!{:x}", content.source) }
+    };
+    let mut labels = vec![
+        (consts::LABEL_DEVICE_ID, device_id)
+    ];
+    match data.variant.unwrap() {
+        Variant::DeviceMetrics(dm) => {
+            gauge!(METRIC_CHAN_UTIL, &labels).set(dm.channel_utilization);
+            gauge!(METRIC_AIR_UTIL, &labels).set(dm.air_util_tx);
+            gauge!(METRIC_BATTERY, &labels).set(dm.battery_level);
+            gauge!(METRIC_VOLTAGE, &labels).set(dm.voltage);
+            gauge!(METRIC_UPTIME, &labels).set(dm.uptime_seconds);
+        }
+        Variant::EnvironmentMetrics(em) => {
+            gauge!(METRIC_TEMPERATURE, &labels).set(em.temperature);
+            gauge!(METRIC_HUMIDITY, &labels).set(em.relative_humidity);
+            gauge!(METRIC_BAROMETRIC_PRESSURE, &labels).set(em.barometric_pressure);
+            gauge!(METRIC_IAQ, &labels).set(em.iaq);
+            gauge!(METRIC_GAS_RESISTANCE, &labels).set(em.gas_resistance);
+        }
+        Variant::AirQualityMetrics(aq) => {
+            gauge!(METRIC_PARTICLES_03UM, &labels).set(aq.particles_03um);
+            gauge!(METRIC_PARTICLES_05UM, &labels).set(aq.particles_05um);
+            gauge!(METRIC_PARTICLES_10UM, &labels).set(aq.particles_10um);
+            gauge!(METRIC_PARTICLES_25UM, &labels).set(aq.particles_25um);
+            gauge!(METRIC_PARTICLES_50UM, &labels).set(aq.particles_50um);
+            gauge!(METRIC_PARTICLES_100UM, &labels).set(aq.particles_100um);
+            gauge!(METRIC_PM10_STANDARD, &labels).set(aq.pm10_standard);
+            gauge!(METRIC_PM25_STANDARD, &labels).set(aq.pm25_standard);
+            gauge!(METRIC_PM100_STANDARD, &labels).set(aq.pm100_standard);
+            gauge!(METRIC_PM10_ENVIRONMENTAL, &labels).set(aq.pm10_environmental);
+            gauge!(METRIC_PM25_ENVIRONMENTAL, &labels).set(aq.pm25_environmental);
+            gauge!(METRIC_PM100_ENVIRONMENTAL, &labels).set(aq.pm100_environmental);
+        }
+        Variant::PowerMetrics(pwr) => {
+            if pwr.ch1_voltage > 0.0 {
+                let mut l_ch1 = labels.clone();
+                l_ch1.push((LABEL_SENSOR_CHANNEL, "ch1".to_string()));
+                gauge!(METRIC_VOLTAGE, &l_ch1).set(pwr.ch1_voltage);
+                gauge!(METRIC_CURRENT, &l_ch1).set(pwr.ch1_current);
+            }
+            if pwr.ch2_voltage > 0.0 {
+                let mut l_ch2 = labels.clone();
+                l_ch2.push((LABEL_SENSOR_CHANNEL, "ch2".to_string()));
+                gauge!(METRIC_VOLTAGE, &l_ch2).set(pwr.ch2_voltage);
+                gauge!(METRIC_CURRENT, &l_ch2).set(pwr.ch2_current);
+            }
+            if pwr.ch3_voltage > 0.0 {
+                let mut l_ch3 = labels.clone();
+                l_ch3.push((LABEL_SENSOR_CHANNEL, "ch3".to_string()));
+                gauge!(METRIC_VOLTAGE, &l_ch3).set(pwr.ch3_voltage);
+                gauge!(METRIC_CURRENT, &l_ch3).set(pwr.ch3_current);
+            }
+        }
+    }
+}
+
 
 pub fn get_secs() -> u64 {
     SystemTime::now()

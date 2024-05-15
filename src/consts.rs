@@ -10,3 +10,4 @@ pub const LABEL_GEOHASH: &str = "geohash";
 pub const LABEL_LICENSED: &str = "is_licensed";
 pub const LABEL_SHORT_NAME: &str = "short_name";
 pub const LABEL_LONG_NAME: &str = "long_name";
+pub const LABEL_SENSOR_CHANNEL: &str = "sensor_channel";
