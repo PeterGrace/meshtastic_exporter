@@ -214,8 +214,8 @@ pub async fn process_position_app(packet: &MeshPacket) {
     let mp_variant::Decoded(content) = packet.clone().payload_variant.unwrap() else { unreachable!() };
     let data = Position::decode(content.payload.as_slice()).unwrap();
     let coord = geohash::Coord {
-        x: GPS_PRECISION_FACTOR.mul(data.latitude_i as f32) as f64,
-        y: GPS_PRECISION_FACTOR.mul(data.longitude_i as f32) as f64,
+        x: GPS_PRECISION_FACTOR.mul(data.longitude_i as f32) as f64,
+        y: GPS_PRECISION_FACTOR.mul(data.latitude_i as f32) as f64,
     };
     let device_id = match content.source {
         0 => { format!("!{:x}", packet.from) }
