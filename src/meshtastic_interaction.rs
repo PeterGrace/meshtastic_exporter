@@ -9,6 +9,7 @@ use meshtastic::types::NodeId;
 use meshtastic::{api::StreamApi, utils};
 use strum::Display;
 use thiserror::Error;
+use crate::consts::LOOP_PAUSE_MILLISECONDS;
 
 #[allow(dead_code)]
 #[derive(Display, Clone, Debug, Error)]
@@ -90,14 +91,14 @@ pub(crate) async fn meshtastic_loop(
     loop {
         if let Ok(fr) = decoded_listener.try_recv() {
             if let Err(e) = tx.send(IPCMessage::FromRadio(fr)).await {
-                error!("Couldn't send FromRadio packet to mpsc: {e}");
+                bail!("Couldn't send FromRadio packet to mpsc: {e}");
             }
         }
         if let Ok(inbound) = rx.try_recv() {
             match inbound {
                 IPCMessage::ToRadio(tr) => {
                     if let Err(e) = _stream_api.send_to_radio_packet(tr.payload_variant).await {
-                        error!("We tried to send a ToRadio message directly but errored: {e}");
+                        bail!("We tried to send a ToRadio message directly but errored: {e}");
                     }
                 }
                 _ => {
@@ -105,6 +106,6 @@ pub(crate) async fn meshtastic_loop(
                 }
             }
         }
-        tokio::time::sleep(tokio::time::Duration::from_millis(250)).await;
+        tokio::time::sleep(tokio::time::Duration::from_millis(LOOP_PAUSE_MILLISECONDS)).await;
     }
 }
