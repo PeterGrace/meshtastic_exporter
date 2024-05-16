@@ -615,7 +615,7 @@ dependencies = [
 
 [[package]]
 name = "meshtastic_exporter"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "anyhow",
  "circular-buffer",
